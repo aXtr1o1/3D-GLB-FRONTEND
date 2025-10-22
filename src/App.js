@@ -1,15 +1,21 @@
-import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
+// App.jsx
+import React, { useState, useRef, useEffect, useMemo, useCallback, Suspense } from "react";
 import {
   Camera, CameraOff, Upload, Sparkles, RotateCcw, User, ArrowRight,
-  Info, ShieldCheck, Cpu, Timer, Smartphone, Wifi, CheckCircle2, Sun, Moon
+  Info, Smartphone, Wifi, CheckCircle2, Sun, Moon
 } from "lucide-react";
-import * as THREE from "three";
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader";
 import { QRCodeSVG } from "qrcode.react";
 import Peer from "peerjs";
 import { DotLottiePlayer } from "@dotlottie/react-player";
-import { DotLottieReact } from '@lottiefiles/dotlottie-react';
+import { DotLottieReact } from "@lottiefiles/dotlottie-react";
 import wave from "./assets/wave.lottie";
+
+/* === Three.js / R3F === */
+import { Canvas, useThree } from "@react-three/fiber";
+import { useGLTF, OrbitControls } from "@react-three/drei";
+import * as THREE from "three";
+import { Stage, Environment, ContactShadows, Html, Bounds, useProgress } from "@react-three/drei";
+
 /* ===========================
    Axtr-inspired palette/tokens
    =========================== */
@@ -92,7 +98,6 @@ function AxtrHeader({ isDark, palette, onToggleTheme }) {
             className="h-12 w-auto transition-all duration-300 group-hover:scale-105"
           />
         </a>
-
 
         <nav className="hidden items-center gap-6 text-sm md:flex">
           {navItems.map((item) => (
@@ -192,46 +197,108 @@ const FaceOutline = ({ palette }) => {
 };
 
 /* ===========================
-   Loader Cube (processing)
+   R3F Helpers
    =========================== */
-const CubeLoader = ({ palette, progress, isDark }) => {
-  const size = 96;
-  const depth = size / 2;
-  const faces = [
-    { transform: `rotateY(0deg) translateZ(${depth}px)` },
-    { transform: `rotateY(90deg) translateZ(${depth}px)` },
-    { transform: `rotateY(180deg) translateZ(${depth}px)` },
-    { transform: `rotateY(-90deg) translateZ(${depth}px)` },
-    { transform: `rotateX(90deg) translateZ(${depth}px)` },
-    { transform: `rotateX(-90deg) translateZ(${depth}px)` },
-  ];
+function Loader() {
+  const { progress, active } = useProgress();
+  if (!active) return null;
   return (
-    <div className="relative mx-auto" style={{ width: size, height: size, perspective: "640px" }}>
-      <div
-        className="axtr-cube"
-        style={{
-          "--cube-bg": `linear-gradient(130deg, ${palette.accent} 0%, ${palette.accent2} 45%, ${palette.accentWarm ?? palette.accent2} 100%)`,
-          "--cube-face-bg": isDark
-            ? "linear-gradient(135deg, rgba(255,255,255,0.28), rgba(225,205,134,0.14))"
-            : "linear-gradient(135deg, rgba(255,255,255,0.85), rgba(37,99,235,0.35))",
-          "--cube-border": isDark ? "rgba(244,244,255,0.25)" : "rgba(37,99,235,0.25)",
-          "--cube-shadow": isDark
-            ? "0 32px 70px -24px rgba(59,255,255,0.35)"
-            : "0 32px 60px -28px rgba(37,99,235,0.25)",
-        }}
-      >
-        {faces.map((s, i) => <span key={i} className="axtr-cube-face" style={s} />)}
+    <Html center>
+      <div className="rounded-xl px-4 py-2 text-sm font-medium"
+           style={{ background: "rgba(0,0,0,0.6)", color: "white" }}>
+        Loading {progress.toFixed(0)}%
       </div>
-      <div
-        className="pointer-events-none absolute inset-0 grid place-items-center text-xl font-semibold tracking-tight"
-        style={{ color: palette.text }}
-      >
-        {Math.min(99, Math.round(progress))}
-        <span className="ml-1 text-sm opacity-75">%</span>
-      </div>
-    </div>
+    </Html>
   );
-};
+}
+
+function GLBModel({ url }) {
+  const { scene } = useGLTF(url, true); // draco support auto (if GLB embedded)
+  // Ensure reasonable materials (avoid overbright)
+  scene.traverse((o) => {
+    if (o.isMesh) {
+      o.castShadow = true;
+      o.receiveShadow = true;
+      if (o.material && 'envMapIntensity' in o.material) {
+        o.material.envMapIntensity = 0.7;
+      }
+    }
+  });
+  return <primitive object={scene} />;
+}
+
+function AutoFitGLB({ url, padding = 1.8 }) {
+  const controls = React.useRef();
+  const { camera, size } = useThree();
+  const { scene } = useGLTF(url);
+
+  // make materials sane & enable shadows
+  React.useMemo(() => {
+    scene.traverse((o) => {
+      if (o.isMesh) {
+        o.castShadow = true;
+        o.receiveShadow = true;
+        if (o.material && "envMapIntensity" in o.material) o.material.envMapIntensity = 0.7;
+        if (o.material && "roughness" in o.material && typeof o.material.roughness === "number") {
+          o.material.roughness = Math.min(1, Math.max(0.2, o.material.roughness));
+        }
+      }
+    });
+    return scene;
+  }, [scene]);
+
+  React.useLayoutEffect(() => {
+    // get bounds
+    const box = new THREE.Box3().setFromObject(scene);
+    const center = box.getCenter(new THREE.Vector3());
+    const sizeV = box.getSize(new THREE.Vector3()); // width=x, height=y, depth=z
+
+    // recentre model at origin so controls target = [0, ty, 0]
+    scene.position.sub(center);
+
+    // camera fit using VERTICAL FOV math
+    const vFov = THREE.MathUtils.degToRad(camera.fov); // vertical fov in radians
+    const aspect = size.width / size.height;
+
+    const halfHeight = sizeV.y / 2;
+    const halfWidth  = sizeV.x / 2;
+
+    // distance required so the full HEIGHT fits
+    const distHeight = halfHeight / Math.tan(vFov / 2);
+    // distance required so the full WIDTH fits (vertical fov -> divide by aspect)
+    const distWidth  = (halfWidth / Math.tan(vFov / 2)) / aspect;
+
+    const distance = padding * Math.max(distHeight, distWidth);
+
+    camera.near = 0.01;
+    camera.far = Math.max(100, distance * 10);
+    camera.position.set(distance * 0.6, distance * 0.35, distance); // nice 3/4 angle
+    camera.updateProjectionMatrix();
+
+    // aim a little above exact center so you see torso+head nicely
+    const targetY = sizeV.y * 0.05;
+    controls.current?.target.set(0, targetY, 0);
+    controls.current?.update();
+  }, [scene, camera, size.width, size.height]);
+
+  return (
+    <>
+      <primitive object={scene} />
+      <OrbitControls
+        ref={controls}
+        makeDefault
+        enablePan
+        enableDamping
+        dampingFactor={0.08}
+        minDistance={0.4}
+        maxDistance={10}
+        maxPolarAngle={Math.PI * 0.98}
+      />
+    </>
+  );
+}
+
+
 
 /* ===========================
    Main app
@@ -264,12 +331,9 @@ export default function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
-  const mountRef = useRef(null);
-  const sceneRef = useRef(null);
-  const rendererRef = useRef(null);
-  const cameraRef = useRef(null);
-  const connectionRef = useRef(null);
-  const peerRef = useRef(null);
+
+  // PeerJS connection ref for mobile → desktop send
+  const mobileConnRef = useRef(null);
 
   const palette = useMemo(() => (isDark ? TOKENS.dark : TOKENS.light), [isDark]);
   const textPrimary = isDark ? "text-white" : "text-slate-900";
@@ -343,15 +407,9 @@ export default function App() {
   }, []);
   useEffect(() => { isCameraActive ? startCamera() : stopCamera(); return () => stopCamera(); }, [isCameraActive, startCamera, stopCamera]);
 
-  /* responsive three.js canvas */
+  /* responsive (layout placeholder) */
   useEffect(() => {
-    const onResize = () => {
-      if (!rendererRef.current || !cameraRef.current || !mountRef.current) return;
-      const w = mountRef.current.clientWidth, h = mountRef.current.clientHeight;
-      rendererRef.current.setSize(w, h);
-      cameraRef.current.aspect = w / h;
-      cameraRef.current.updateProjectionMatrix();
-    };
+    const onResize = () => {};
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
@@ -362,14 +420,11 @@ export default function App() {
     let cancelled = false;
 
     const peer = new Peer(sessionId, { host: "0.peerjs.com", port: 443, secure: true });
-    peerRef.current = peer;
     setPairingStatus("waiting");
     setPeerError("");
 
     peer.on("connection", (conn) => {
       if (cancelled) return;
-      if (connectionRef.current) connectionRef.current.close?.();
-      connectionRef.current = conn;
       setPairingStatus("connected");
 
       conn.on("data", async (payload) => {
@@ -391,47 +446,39 @@ export default function App() {
       });
 
       conn.on("error", () => { setPeerError("Connection interrupted."); setPairingStatus("error"); });
-      conn.on("close", () => { if (!cancelled) { connectionRef.current = null; setPairingStatus("waiting"); } });
+      conn.on("close", () => { if (!cancelled) { setPairingStatus("waiting"); } });
     });
 
     peer.on("error", (e) => { if (!cancelled) { setPeerError(e?.message || "Peer error"); setPairingStatus("error"); } });
 
-    return () => { cancelled = true; connectionRef.current?.close?.(); peer.destroy(); peerRef.current = null; };
+    return () => { cancelled = true; peer.destroy(); };
   }, [clientType, sessionId]);
 
-  /* pairing: mobile connect */
+  /* pairing: mobile connect (FIX: store conn and actually send) */
   useEffect(() => {
     if (clientType !== "mobile" || !sessionId) return;
     let cancelled = false;
     const peer = new Peer(undefined, { host: "0.peerjs.com", port: 443, secure: true });
-    peerRef.current = peer;
 
     const connect = () => {
-      if (cancelled || connectionRef.current) return;
+      if (cancelled) return;
       const conn = peer.connect(sessionId, { reliable: true });
-      connectionRef.current = conn;
+      mobileConnRef.current = conn;
 
       conn.on("open", () => { setPairingStatus("connected"); setPeerError(""); });
       conn.on("data", (p) => { if (p?.type === "ack") setPairingStatus("received"); });
-      conn.on("error", () => { setPeerError("Connection lost. Reconnecting…"); setPairingStatus("error"); connectionRef.current = null; setTimeout(connect, 1200); });
-      conn.on("close", () => { setPairingStatus("waiting"); connectionRef.current = null; setTimeout(connect, 1200); });
+      conn.on("error", () => { setPeerError("Connection lost. Reconnecting…"); setPairingStatus("error"); setTimeout(connect, 1200); });
+      conn.on("close", () => { setPairingStatus("waiting"); setTimeout(connect, 1200); });
     };
 
     peer.on("open", connect);
     peer.on("error", (e) => { setPeerError(e?.message || "Peer error"); setPairingStatus("error"); });
 
-    return () => { cancelled = true; connectionRef.current?.close?.(); peer.destroy(); peerRef.current = null; };
+    return () => { cancelled = true; try { peer.destroy(); } catch {} };
   }, [clientType, sessionId]);
 
-  /* progress sim */
+  /* progress sim (optional placeholder) */
   const stopProgress = useCallback(() => { if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; } }, []);
-  const simulateProgress = useCallback(() => {
-    stopProgress();
-    setProgress(10);
-    progressTimerRef.current = window.setInterval(() => {
-      setProgress((p) => Math.min(96, p + 2 + Math.random() * 8));
-    }, 520);
-  }, [stopProgress]);
   useEffect(() => stopProgress, [stopProgress]);
 
   /* capture & upload */
@@ -450,14 +497,25 @@ export default function App() {
     stopCamera(); setIsCameraActive(false); setCapturedImage(f); setError(null); e.target.value = "";
   }, [stopCamera]);
 
-  /* send from mobile */
+  /* send from mobile (FIX: actually sends via conn) */
   const sendBlobToDesktop = useCallback((blob) => {
     if (!blob) return;
-    const conn = connectionRef.current;
-    if (!conn?.open) { setPairingStatus("waiting"); setPeerError("Desktop not connected yet."); return; }
+    const conn = mobileConnRef.current;
+    if (!conn || conn.open !== true) {
+      setPeerError("Not connected to desktop.");
+      setPairingStatus("error");
+      return;
+    }
     setPairingStatus("sending"); setMobileSending(true);
     const reader = new FileReader();
-    reader.onloadend = () => { conn.send({ type: "image", data: reader.result }); setMobileSending(false); setPairingStatus("sent"); };
+    reader.onloadend = () => {
+      try {
+        conn.send({ type: "image", data: reader.result });
+        setMobileSending(false); setPairingStatus("sent");
+      } catch (e) {
+        setMobileSending(false); setPairingStatus("error"); setPeerError("Failed to send image.");
+      }
+    };
     reader.onerror = () => { setMobileSending(false); setPairingStatus("error"); setPeerError("Failed to encode image."); };
     reader.readAsDataURL(blob instanceof Blob ? blob : new Blob([blob], { type: "image/jpeg" }));
   }, []);
@@ -465,12 +523,12 @@ export default function App() {
   /* generation -> your existing endpoint */
   const generateAvatar = useCallback(async () => {
     if (!capturedImage) return setError("Please capture or upload an image first.");
-    setIsGenerating(true); setError(null); setStep(2); simulateProgress();
+    setIsGenerating(true); setError(null); setStep(2);
 
     const formData = new FormData();
     const imageFile = capturedImage instanceof File
       ? capturedImage
-      : new File([capturedImage], "selfie.jpg", { type: capturedImage.type || "image/jpeg" });
+      : new File([capturedImage], "selfie.jpg", { type: capturedImage?.type || "image/jpeg" });
 
     formData.append("gender", gender);
     formData.append("image", imageFile);
@@ -481,74 +539,18 @@ export default function App() {
       if (data.status === "completed" && data.outputs?.[0]) {
         const url = data.outputs[0];
         setGeneratedModel(url);
-        load3DModel(url);
-        setProgress(100); stopProgress(); setStep(3);
+        setProgress(100);
+        setStep(3);
+        // Preload GLB (optional)
+        try { useGLTF.preload(url); } catch {}
       } else {
         throw new Error("Generation failed");
       }
     } catch {
-      stopProgress(); setError("Failed to generate avatar. Please try again."); setStep(1);
+      setError("Failed to generate avatar. Please try again.");
+      setStep(1);
     } finally { setIsGenerating(false); }
-  }, [capturedImage, gender, simulateProgress, stopProgress]);
-
-  /* three.js viewer */
-  const load3DModel = useCallback((url) => {
-    if (!mountRef.current) return;
-
-    if (rendererRef.current && mountRef.current.contains(rendererRef.current.domElement)) {
-      mountRef.current.removeChild(rendererRef.current.domElement);
-    }
-    rendererRef.current?.dispose?.();
-
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(isDark ? 0x0b0f1a : 0xf8fafc);
-    sceneRef.current = scene;
-
-    const w = mountRef.current.clientWidth || 640;
-    const h = mountRef.current.clientHeight || 360;
-
-    const cam = new THREE.PerspectiveCamera(45, w / h, 0.1, 1000);
-    cam.position.set(0, 0, 3);
-    cameraRef.current = cam;
-
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
-    renderer.setSize(w, h);
-    mountRef.current.appendChild(renderer.domElement);
-    rendererRef.current = renderer;
-
-    scene.add(new THREE.AmbientLight(0xffffff, 0.9));
-    const dir = new THREE.DirectionalLight(0xffffff, 0.6); dir.position.set(4, 6, 6); scene.add(dir);
-
-    const loader = new GLTFLoader();
-    loader.load(
-      url,
-      (gltf) => {
-        const model = gltf.scene;
-        const box = new THREE.Box3().setFromObject(model);
-        const center = box.getCenter(new THREE.Vector3());
-        const size = box.getSize(new THREE.Vector3());
-        const maxDim = Math.max(size.x, size.y, size.z);
-        const scale = 2.1 / maxDim;
-        model.scale.multiplyScalar(scale);
-        model.position.sub(center.multiplyScalar(scale));
-        scene.add(model);
-
-        let t = 0;
-        const animate = () => {
-          if (!rendererRef.current) return;
-          t += 0.01;
-          model.rotation.y += 0.005;
-          model.position.y = Math.sin(t) * 0.02;
-          rendererRef.current.render(scene, cam);
-          requestAnimationFrame(animate);
-        };
-        animate();
-      },
-      undefined,
-      () => setError("Unable to render the 3D model.")
-    );
-  }, [isDark]);
+  }, [capturedImage, gender]);
 
   /* UI atoms */
   const StepBadge = () => (
@@ -560,12 +562,6 @@ export default function App() {
 
   /* Screens */
   const Hero = () => {
-    const stats = [
-      { value: "50+", label: "Agentic SaaS rollouts" },
-      { value: "12 ms", label: "Realtime inference loop" },
-      { value: "98%", label: "Retention uplift" },
-    ];
-
     return (
       <section id="hero" className="relative overflow-hidden py-20 sm:py-24">
         <div className="axtr-water absolute inset-0 -z-20" />
@@ -594,40 +590,23 @@ export default function App() {
             Orchestrate lifelike avatars and AI agents that feel as fluid as water.
           </h1>
 
-          {/* <div
-            className="axtr-float relative mt-10 grid h-56 w-56 place-items-center rounded-full border"
+          <div
+            className="axtr-float relative grid h-56 w-56 place-items-center rounded-full overflow-hidden border"
             style={{
               borderColor: "rgba(255,255,255,0.12)",
-              background: "radial-gradient(100% 100% at 50% 50%, rgba(59,255,255,0.12) 0%, transparent 65%)",
+              background:
+                "radial-gradient(100% 100% at 50% 50%, rgba(59,255,255,0.12) 0%, transparent 65%)",
               boxShadow: "0 40px 80px -60px rgba(59,255,255,0.45)",
             }}
           >
-            <div className="absolute inset-8 rounded-full border border-white/15" />
-            <User className="h-14 w-14 text-white/80" />
-            <div className="absolute -inset-4 rounded-full border border-white/10 opacity-50" />
-          </div> */}
-
-          <div
-  className="axtr-float relative grid h-56 w-56 place-items-center rounded-full overflow-hidden border"
-  style={{
-    borderColor: "rgba(255,255,255,0.12)",
-    background:
-      "radial-gradient(100% 100% at 50% 50%, rgba(59,255,255,0.12) 0%, transparent 65%)",
-    boxShadow: "0 40px 80px -60px rgba(59,255,255,0.45)",
-  }}
->
-  {/* Lottie ripple backdrop (dotLottie player) */}
-  <DotLottiePlayer
-    src={wave}
-    autoplay
-    loop
-    className="absolute inset-0 pointer-events-none"
-  />
-
-  {/* User icon on top */}
-  <User className="relative z-10 h-14 w-14 text-white/80" />
-</div>
-
+            <DotLottiePlayer
+              src={wave}
+              autoplay
+              loop
+              className="absolute inset-0 pointer-events-none"
+            />
+            <User className="relative z-10 h-14 w-14 text-white/80" />
+          </div>
 
           <p className={`max-w-3xl text-lg md:text-xl ${textMuted}`}>
             Feed your pipeline with cinematic 3D avatars, live camera capture and Peer-to-Peer handoff. aXtrLabs stitches vision,
@@ -655,25 +634,6 @@ export default function App() {
               Explore workflow
             </button>
           </div>
-
-          {/* <div className="grid w-full grid-cols-1 gap-4 sm:grid-cols-3">
-            {stats.map((item) => (
-              <div
-                key={item.label}
-                className="axtr-glass px-6 py-5 text-left"
-                style={{
-                  background: isDark ? "rgba(255,255,255,0.03)" : "rgba(255,255,255,0.9)",
-                  borderColor: palette.border,
-                  color: palette.text,
-                  "--axtr-glow": isDark ? "rgba(59,255,255,0.35)" : "rgba(37,99,235,0.25)",
-                }}
-              >
-                <div className="text-3xl font-semibold tracking-tight">{item.value}</div>
-                <div className={`mt-1 text-sm ${textSubtle}`}>{item.label}</div>
-              </div>
-            ))}
-          </div> */}
-
         </div>
       </section>
     );
@@ -715,229 +675,230 @@ export default function App() {
 
     return (
       <section id="gallery" className="relative overflow-hidden py-16">
-      <div className="axtr-water pointer-events-none absolute inset-0 -z-20 opacity-35" />
-      <div className="absolute inset-0 -z-10 opacity-60">
-        <SubtleOrbs palette={palette} isDark={isDark} />
-      </div>
-      <div className="text-center space-y-4">
-        <StepBadge />
-        <h2 className={`text-4xl font-extrabold ${textPrimary}`}>Connect Your Mobile Device</h2>
-        <p className={`max-w-2xl mx-auto ${textMuted}`}>
-          Your desktop orchestrates the workflow; your phone acts as the lens. Pair them instantly via Peer-to-Peer QR handoff and keep capture streams perfectly in sync.
-        </p>
-      </div>
-
-      <div className="mx-auto mt-12 grid max-w-6xl gap-8 md:grid-cols-2">
-        {/* QR + status */}
-        <div
-          className="axtr-glass h-full p-8"
-          style={{
-            background: isDark ? "rgba(9,12,18,0.82)" : "rgba(255,255,255,0.9)",
-            borderColor: palette.border,
-            "--axtr-glow": isDark ? "rgba(225,205,134,0.28)" : "rgba(37,99,235,0.2)",
-          }}
-        >
-          <div className="flex items-center justify-between gap-3">
-            <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.4em] ${isDark ? "bg-white/5 text-white/70" : "bg-slate-100 text-slate-600"}`}>
-              <Smartphone className="h-4 w-4" /> Mobile Link
-            </span>
-            <span className={`font-mono text-sm ${textSubtle}`}>{sessionId}</span>
-          </div>
-
-          <div className="mt-8 flex justify-center">
-            <div
-              className="rounded-3xl p-5 shadow-[0_30px_60px_-40px_rgba(59,255,255,0.4)]"
-              style={{ background: palette.surface2, border: `1px solid ${palette.border}` }}
-            >
-              {shareLink ? (
-                <QRCodeSVG value={shareLink} size={200} bgColor="transparent" fgColor={isDark ? "#f5f5f5" : "#1f2937"} level="H" includeMargin />
-              ) : (
-                <div className="grid h-48 w-48 place-items-center text-sm text-slate-400">Preparing link...</div>
-              )}
-            </div>
-          </div>
-
-          <div
-            className="mt-8 inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm font-medium transition-all duration-500"
-            style={status}
-          >
-            <Wifi className="h-4 w-4" /> {pairingCopy[pairingStatus] || pairingCopy.idle}
-          </div>
-
-          <ol className={`mt-8 space-y-3 text-sm ${textMuted}`}>
-            <li className="flex items-start gap-3">
-              <span className="mt-1 h-1.5 w-1.5 rounded-full bg-white/60" />
-              Launch the camera app on your phone.
-            </li>
-            <li className="flex items-start gap-3">
-              <span className="mt-1 h-1.5 w-1.5 rounded-full bg-white/60" />
-              Scan the QR code to open the secure capture link.
-            </li>
-            <li className="flex items-start gap-3">
-              <span className="mt-1 h-1.5 w-1.5 rounded-full bg-white/60" />
-              Follow the framing guide and submit your selfie.
-            </li>
-          </ol>
-
-          {lastReceivedAt && (
-            <p className={`mt-6 text-xs ${textSubtle}`}>
-              Last capture received at {lastReceivedAt.toLocaleTimeString()}
-            </p>
-          )}
-
-          {peerError && (
-            <div className="mt-6 flex items-center gap-2 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
-              <Info className="h-4 w-4" /> {peerError}
-            </div>
-          )}
+        <div className="axtr-water pointer-events-none absolute inset-0 -z-20 opacity-35" />
+        <div className="absolute inset-0 -z-10 opacity-60">
+          <SubtleOrbs palette={palette} isDark={isDark} />
         </div>
-        {/* Desktop capture */}
-        <div
-          className="axtr-glass h-full p-8"
-          style={{
-            background: isDark ? "rgba(9,12,18,0.82)" : "rgba(255,255,255,0.9)",
-            borderColor: palette.border,
-            "--axtr-glow": isDark ? "rgba(59,255,255,0.35)" : "rgba(37,99,235,0.25)",
-          }}
-        >
-          <div className="flex items-center justify-between">
-            <h3 className={`text-lg font-semibold ${textPrimary} flex items-center gap-2`}><Camera className="h-5 w-5" /> Capture on desktop</h3>
-            <span className={`text-xs uppercase tracking-[0.4em] ${textSubtle}`}>Studio view</span>
+        <div className="text-center space-y-4">
+          <StepBadge />
+          <h2 className={`text-4xl font-extrabold ${textPrimary}`}>Connect Your Mobile Device</h2>
+          <p className={`max-w-2xl mx-auto ${textMuted}`}>
+            Your desktop orchestrates the workflow; your phone acts as the lens. Pair them instantly via Peer-to-Peer QR handoff and keep capture streams perfectly in sync.
+          </p>
+        </div>
+
+        <div className="mx-auto mt-12 grid max-w-6xl gap-8 md:grid-cols-2">
+          {/* QR + status */}
+          <div
+            className="axtr-glass h-full p-8"
+            style={{
+              background: isDark ? "rgba(9,12,18,0.82)" : "rgba(255,255,255,0.9)",
+              borderColor: palette.border,
+              "--axtr-glow": isDark ? "rgba(225,205,134,0.28)" : "rgba(37,99,235,0.2)",
+            }}
+          >
+            <div className="flex items-center justify-between gap-3">
+              <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.4em] ${isDark ? "bg-white/5 text-white/70" : "bg-slate-100 text-slate-600"}`}>
+                <Smartphone className="h-4 w-4" /> Mobile Link
+              </span>
+              <span className={`font-mono text-sm ${textSubtle}`}>{sessionId}</span>
+            </div>
+
+            <div className="mt-8 flex justify-center">
+              <div
+                className="rounded-3xl p-5 shadow-[0_30px_60px_-40px_rgba(59,255,255,0.4)]"
+                style={{ background: palette.surface2, border: `1px solid ${palette.border}` }}
+              >
+                {shareLink ? (
+                  <QRCodeSVG value={shareLink} size={200} bgColor="transparent" fgColor={isDark ? "#f5f5f5" : "#1f2937"} level="H" includeMargin />
+                ) : (
+                  <div className="grid h-48 w-48 place-items-center text-sm text-slate-400">Preparing link...</div>
+                )}
+              </div>
+            </div>
+
+            <div
+              className="mt-8 inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm font-medium transition-all duration-500"
+              style={status}
+            >
+              <Wifi className="h-4 w-4" /> {pairingCopy[pairingStatus] || pairingCopy.idle}
+            </div>
+
+            <ol className={`mt-8 space-y-3 text-sm ${textMuted}`}>
+              <li className="flex items-start gap-3">
+                <span className="mt-1 h-1.5 w-1.5 rounded-full bg-white/60" />
+                Launch the camera app on your phone.
+              </li>
+              <li className="flex items-start gap-3">
+                <span className="mt-1 h-1.5 w-1.5 rounded-full bg-white/60" />
+                Scan the QR code to open the secure capture link.
+              </li>
+              <li className="flex items-start gap-3">
+                <span className="mt-1 h-1.5 w-1.5 rounded-full bg-white/60" />
+                Follow the framing guide and submit your selfie.
+              </li>
+            </ol>
+
+            {lastReceivedAt && (
+              <p className={`mt-6 text-xs ${textSubtle}`}>
+                Last capture received at {lastReceivedAt.toLocaleTimeString()}
+              </p>
+            )}
+
+            {peerError && (
+              <div className="mt-6 flex items-center gap-2 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+                <Info className="h-4 w-4" /> {peerError}
+              </div>
+            )}
           </div>
 
-          {!capturedImage ? (
-            <>
-              {isCameraActive ? (
-                <div
-                  className="relative mt-6 aspect-[4/3] overflow-hidden rounded-2xl border"
-                  style={{ background: palette.surface2, border: `1px solid ${palette.border}` }}
-                >
-                  <video ref={videoRef} autoPlay playsInline className="h-full w-full object-cover" />
-                  <FaceOutline palette={palette} />
+          {/* Desktop capture */}
+          <div
+            className="axtr-glass h-full p-8"
+            style={{
+              background: isDark ? "rgba(9,12,18,0.82)" : "rgba(255,255,255,0.9)",
+              borderColor: palette.border,
+              "--axtr-glow": isDark ? "rgba(59,255,255,0.35)" : "rgba(37,99,235,0.25)",
+            }}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className={`text-lg font-semibold ${textPrimary} flex items-center gap-2`}><Camera className="h-5 w-5" /> Capture on desktop</h3>
+              <span className={`text-xs uppercase tracking-[0.4em] ${textSubtle}`}>Studio view</span>
+            </div>
+
+            {!capturedImage ? (
+              <>
+                {isCameraActive ? (
+                  <div
+                    className="relative mt-6 aspect-[4/3] overflow-hidden rounded-2xl border"
+                    style={{ background: palette.surface2, border: `1px solid ${palette.border}` }}
+                  >
+                    <video ref={videoRef} autoPlay playsInline className="h-full w-full object-cover" />
+                    <FaceOutline palette={palette} />
+                  </div>
+                ) : (
+                  <div
+                    className="mt-6 flex aspect-[4/3] items-center justify-center rounded-2xl border border-dashed"
+                    style={{ background: palette.surface2, borderColor: palette.border }}
+                  >
+                    <div className="text-center">
+                      <User className="mx-auto mb-3 h-12 w-12 text-white/40" />
+                      <p className={textMuted}>Start camera or upload an image</p>
+                    </div>
+                  </div>
+                )}
+
+                <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (isCameraActive) {
+                        capturePhoto();
+                      } else {
+                        setError(null);
+                        setIsCameraActive(true);
+                      }
+                    }}
+                    className={`w-full rounded-xl px-4 py-3 font-semibold transition-all duration-500 ${isDark ? "bg-white text-slate-900 hover:shadow-[0_20px_40px_-30px_rgba(59,255,255,0.65)]" : "bg-slate-900 text-white hover:bg-slate-800"}`}
+                  >
+                    {isCameraActive ? "Capture photo" : "Start camera"}
+                  </button>
+
+                  <label className="block">
+                    <input type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
+                    <div
+                      className="w-full cursor-pointer rounded-xl px-4 py-3 text-center text-sm font-medium transition-all duration-500"
+                      style={{
+                        background: isDark ? "rgba(255,255,255,0.06)" : "rgba(15,23,42,0.05)",
+                        color: palette.text,
+                      }}
+                    >
+                      <Upload className="mr-2 inline h-4 w-4" />
+                      Upload photo
+                    </div>
+                  </label>
                 </div>
-              ) : (
+              </>
+            ) : (
+              <>
                 <div
-                  className="mt-6 flex aspect-[4/3] items-center justify-center rounded-2xl border border-dashed"
+                  className="mt-6 aspect-[4/3] overflow-hidden rounded-2xl border"
                   style={{ background: palette.surface2, borderColor: palette.border }}
                 >
-                  <div className="text-center">
-                    <User className="mx-auto mb-3 h-12 w-12 text-white/40" />
-                    <p className={textMuted}>Start camera or upload an image</p>
-                  </div>
+                  <img src={URL.createObjectURL(capturedImage)} alt="Captured" className="h-full w-full object-cover" />
                 </div>
-              )}
 
-              <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                <label className={`mt-5 block text-sm font-semibold ${textSubtle}`}>Select gender</label>
+                <div className="mt-3 grid grid-cols-2 gap-3">
+                  {["male", "female"].map((g) => (
+                    <button
+                      key={g}
+                      onClick={() => setGender(g)}
+                      className={`rounded-xl px-4 py-2.5 font-semibold capitalize transition-all duration-500 ${
+                        gender === g
+                          ? "bg-white text-slate-900 shadow-[0_18px_40px_-28px_rgba(59,255,255,0.5)]"
+                          : "bg-white/10 text-white hover:bg-white/15"
+                      }`}
+                      type="button"
+                    >
+                      {g}
+                    </button>
+                  ))}
+                </div>
+
                 <button
-                  type="button"
-                  onClick={() => {
-                    if (isCameraActive) {
-                      capturePhoto();
-                    } else {
-                      setError(null);
-                      setIsCameraActive(true);
-                    }
+                  onClick={generateAvatar}
+                  disabled={isGenerating}
+                  className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-base font-semibold text-black transition-all duration-500 disabled:opacity-60"
+                  style={{
+                    background: `linear-gradient(120deg, ${palette.accent} 0%, ${palette.accent2} 45%, ${palette.accentWarm} 100%)`,
+                    boxShadow: "0 22px 60px -28px rgba(59,255,255,0.45)",
                   }}
-                  className={`w-full rounded-xl px-4 py-3 font-semibold transition-all duration-500 ${isDark ? "bg-white text-slate-900 hover:shadow-[0_20px_40px_-30px_rgba(59,255,255,0.65)]" : "bg-slate-900 text-white hover:bg-slate-800"}`}
+                  type="button"
                 >
-                  {isCameraActive ? "Capture photo" : "Start camera"}
+                  {isGenerating ? (
+                    <>
+                      <div className="h-4 w-4 animate-spin rounded-full border-2 border-black/40 border-t-transparent" />
+                      Generating
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-4 w-4" />
+                      Generate 3D avatar
+                    </>
+                  )}
                 </button>
 
-                <label className="block">
-                  <input type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
-                  <div
-                    className="w-full cursor-pointer rounded-xl px-4 py-3 text-center text-sm font-medium transition-all duration-500"
-                    style={{
-                      background: isDark ? "rgba(255,255,255,0.06)" : "rgba(15,23,42,0.05)",
-                      color: palette.text,
-                    }}
-                  >
-                    <Upload className="mr-2 inline h-4 w-4" />
-                    Upload photo
-                  </div>
-                </label>
-              </div>
-            </>
-          ) : (
-            <>
+                <button
+                  onClick={() => {
+                    setCapturedImage(null);
+                    setIsCameraActive(false);
+                  }}
+                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-medium transition-all duration-500"
+                  style={{
+                    background: isDark ? "rgba(255,255,255,0.04)" : "rgba(15,23,42,0.05)",
+                    color: palette.text,
+                  }}
+                  type="button"
+                >
+                  <RotateCcw className="h-4 w-4" />
+                  Start over
+                </button>
+              </>
+            )}
+
+            {error && (
               <div
-                className="mt-6 aspect-[4/3] overflow-hidden rounded-2xl border"
-                style={{ background: palette.surface2, borderColor: palette.border }}
+                className="mt-4 rounded-xl border px-4 py-3 text-sm"
+                style={{ background: "rgba(248,113,113,0.12)", borderColor: "rgba(248,113,113,0.35)", color: "#fecaca" }}
               >
-                <img src={URL.createObjectURL(capturedImage)} alt="Captured" className="h-full w-full object-cover" />
+                {error}
               </div>
-
-              <label className={`mt-5 block text-sm font-semibold ${textSubtle}`}>Select gender</label>
-              <div className="mt-3 grid grid-cols-2 gap-3">
-                {["male", "female"].map((g) => (
-                  <button
-                    key={g}
-                    onClick={() => setGender(g)}
-                    className={`rounded-xl px-4 py-2.5 font-semibold capitalize transition-all duration-500 ${
-                      gender === g
-                        ? "bg-white text-slate-900 shadow-[0_18px_40px_-28px_rgba(59,255,255,0.5)]"
-                        : "bg-white/10 text-white hover:bg-white/15"
-                    }`}
-                    type="button"
-                  >
-                    {g}
-                  </button>
-                ))}
-              </div>
-
-              <button
-                onClick={generateAvatar}
-                disabled={isGenerating}
-                className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-base font-semibold text-black transition-all duration-500 disabled:opacity-60"
-                style={{
-                  background: `linear-gradient(120deg, ${palette.accent} 0%, ${palette.accent2} 45%, ${palette.accentWarm} 100%)`,
-                  boxShadow: "0 22px 60px -28px rgba(59,255,255,0.45)",
-                }}
-                type="button"
-              >
-                {isGenerating ? (
-                  <>
-                    <div className="h-4 w-4 animate-spin rounded-full border-2 border-black/40 border-t-transparent" />
-                    Generating
-                  </>
-                ) : (
-                  <>
-                    <Sparkles className="h-4 w-4" />
-                    Generate 3D avatar
-                  </>
-                )}
-              </button>
-
-              <button
-                onClick={() => {
-                  setCapturedImage(null);
-                  setIsCameraActive(false);
-                }}
-                className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-medium transition-all duration-500"
-                style={{
-                  background: isDark ? "rgba(255,255,255,0.04)" : "rgba(15,23,42,0.05)",
-                  color: palette.text,
-                }}
-                type="button"
-              >
-                <RotateCcw className="h-4 w-4" />
-                Start over
-              </button>
-            </>
-          )}
-
-          {error && (
-            <div
-              className="mt-4 rounded-xl border px-4 py-3 text-sm"
-              style={{ background: "rgba(248,113,113,0.12)", borderColor: "rgba(248,113,113,0.35)", color: "#fecaca" }}
-            >
-              {error}
-            </div>
-          )}
+            )}
+          </div>
         </div>
-      </div>
-    </section>
-  );
+      </section>
+    );
   };
 
   const Processing = () => (
@@ -950,12 +911,13 @@ export default function App() {
         <p className={`mx-auto max-w-2xl ${textMuted}`}>
           Our renderer blends photogrammetry, rigging clean-up and material tuning. Keep this tab open; progress glides smoothly toward 100%.
         </p>
-        <div className="mt-10">
+        <div className="mt-10 grid place-items-center">
           <DotLottieReact
-  src="https://lottie.host/f570eef6-9037-47ce-92f2-024456cec1b0/0B8w9hWZly.lottie"
-  loop
-  autoplay/>
-
+            src="https://lottie.host/f570eef6-9037-47ce-92f2-024456cec1b0/0B8w9hWZly.lottie"
+            loop
+            autoplay
+            style={{ width: 360, height: 360 }}
+          />
         </div>
         <div className={`mt-6 flex items-center justify-center gap-2 text-sm ${textSubtle}`}>
           <Info className="h-4 w-4" />
@@ -964,6 +926,7 @@ export default function App() {
       </div>
     </section>
   );
+
   const Ready = () => (
     <section id="ready" className="relative overflow-hidden py-14">
       <div className="axtr-water pointer-events-none absolute inset-0 -z-20 opacity-35" />
@@ -977,6 +940,7 @@ export default function App() {
       </div>
 
       <div className="mx-auto mt-10 grid max-w-6xl gap-8 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
+        {/* R3F Canvas */}
         <div
           className="axtr-glass p-4"
           style={{
@@ -985,7 +949,45 @@ export default function App() {
             "--axtr-glow": isDark ? "rgba(59,255,255,0.35)" : "rgba(37,99,235,0.25)",
           }}
         >
-          <div ref={mountRef} className="aspect-video rounded-2xl" style={{ background: palette.canvas }} />
+          <div className="rounded-2xl overflow-hidden" style={{ background: palette.canvas }}>
+            {generatedModel ? (
+              <div style={{ width: "100%", height: "min(72vh, 70vw)" }}>
+                <Canvas
+                  shadows
+                  dpr={[1, 2]}
+                  camera={{ position: [0, 1.2, 2], fov: 60, near: 0.01, far: 100 }}
+                  gl={{ antialias: true }}
+                >
+                  <Suspense fallback={<Loader />}>
+                    <Environment preset="city" />
+                    <hemisphereLight intensity={0.35} />
+                    <directionalLight
+                      castShadow
+                      intensity={1.0}
+                      position={[3, 5, 2]}
+                      shadow-mapSize-width={2048}
+                      shadow-mapSize-height={2048}
+                    />
+                    <AutoFitGLB url={generatedModel} />
+                    <ContactShadows
+                      position={[0, -0.001, 0]}
+                      opacity={0.3}
+                      blur={2.5}
+                      far={5}
+                      resolution={1024}
+                      scale={8}
+                    />
+                  </Suspense>
+                </Canvas>
+
+
+              </div>
+            ) : (
+              <div className="aspect-video grid place-items-center text-sm" style={{ color: palette.muted }}>
+                Model not ready yet.
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="space-y-4">
@@ -1007,8 +1009,11 @@ export default function App() {
 
           <div className="grid gap-3 sm:grid-cols-2">
             <button
-              onClick={() => generatedModel && load3DModel(generatedModel)}
-              className={`flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold transition-all duration-500 ${isDark ? "bg-white/10 hover:bg-white/15 text-white" : "bg-slate-100 hover:bg-slate-200 text-slate-700"}`}
+              onClick={() => {
+                // simple orbit reset: reload same URL to force Bounds recompute (cheap trick)
+                setGeneratedModel((u) => (u ? `${u}${u.includes("#r") ? "" : "#r"}` : u));
+              }}
+              className={`flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold transition-all duration-500 ${isDark ? "bg-white/10 hover:bg_white/15 text-white" : "bg-slate-100 hover:bg-slate-200 text-slate-700"}`.replace("_","/")}
               type="button"
             >
               <RotateCcw className="h-4 w-4" /> Reset view
@@ -1048,6 +1053,7 @@ export default function App() {
       </div>
     </section>
   );
+
   const MobileCapture = () => (
     <div className="min-h-screen relative" style={{ background: palette.canvas, color: palette.text }}>
       <div className="axtr-water pointer-events-none absolute inset-0 -z-20 opacity-35" />
@@ -1163,19 +1169,5 @@ export default function App() {
   );
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+/* drei GLTF loader cache cleanup on HMR (optional) */
+useGLTF.clear = useGLTF.clear || (() => {});
