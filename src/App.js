@@ -59,11 +59,22 @@ const pairingCopy = {
 /* ===========================
    Small helpers
    =========================== */
-const createSessionId = () =>
-  (window.crypto?.randomUUID?.() ?? Math.random().toString(36))
-    .replace(/-/g, "")
-    .slice(0, 10)
-    .toUpperCase();
+// ✅ Only allow [a-z0-9_-], force lowercase, and cap length
+const normalizePeerId = (s) =>
+  (s || "")
+    .toString()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "")
+    .slice(0, 24);
+
+// ✅ Strong random id with safe characters (no dots)
+const createSessionId = () => {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = new Uint8Array(12);
+  (window.crypto?.getRandomValues?.(bytes) ?? bytes.fill(Math.random() * 256));
+  return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join("");
+};
+
 
 const dataUrlToFile = async (dataUrl, filename) => {
   const res = await fetch(dataUrl);
@@ -342,39 +353,33 @@ export default function App() {
 
   /* session + role by query */
   const shareLink = useMemo(() => {
-    if (!sessionId || typeof window === "undefined") return "";
-    const url = new URL(window.location.origin + window.location.pathname);
-    url.searchParams.set("mobile", "1");
-    url.searchParams.set("session", sessionId);
-    return url.toString();
-  }, [sessionId]);
+  if (!sessionId || typeof window === "undefined") return "";
+  const id = normalizePeerId(sessionId);
+  const url = new URL(window.location.origin + window.location.pathname);
+  url.searchParams.set("mobile", "1");
+  url.searchParams.set("session", id);
+  return url.toString();
+}, [sessionId]);
+
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const mobile = params.get("mobile") === "1";
-    const s = params.get("session");
+  const params = new URLSearchParams(window.location.search);
+  const mobile = params.get("mobile") === "1";
+  const s = normalizePeerId(params.get("session"));
 
-    if (mobile) {
-      setClientType("mobile");
-      if (s) {
-        setSessionId(s.toUpperCase());
-      } else {
-        setPeerError("Missing session id.");
-        setPairingStatus("error");
-      }
+  if (mobile) {
+    setClientType("mobile");
+    if (s) {
+    setSessionId(s);
     } else {
-      setClientType("desktop");
-      setSessionId((s ? s : createSessionId()).toUpperCase());
+      setPeerError("Missing session id.");
+      setPairingStatus("error");
     }
-  }, []);
-
-  useEffect(() => {
-    if (clientType !== "desktop" || !sessionId) return;
-    const u = new URL(window.location.href);
-    u.searchParams.set("session", sessionId);
-    u.searchParams.delete("mobile");
-    window.history.replaceState({}, "", u.toString());
-  }, [clientType, sessionId]);
+  } else {
+    setClientType("desktop");
+  setSessionId(normalizePeerId(s) || createSessionId());
+  }
+}, []);
 
   /* camera lifecycle */
   const startCamera = useCallback(async () => {
@@ -416,66 +421,94 @@ export default function App() {
 
   /* pairing: desktop accept */
   useEffect(() => {
-    if (clientType !== "desktop" || !sessionId) return;
-    let cancelled = false;
+  if (clientType !== "desktop" || !sessionId) return;
 
-    const peer = new Peer(sessionId, { host: "0.peerjs.com", port: 443, secure: true });
-    setPairingStatus("waiting");
-    setPeerError("");
+  const id = normalizePeerId(sessionId);
+  if (!id) {
+    setPeerError("Invalid session id.");
+    setPairingStatus("error");
+    return;
+  }
 
-    peer.on("connection", (conn) => {
-      if (cancelled) return;
-      setPairingStatus("connected");
+  let cancelled = false;
+  const peer = new Peer(id, { host: "0.peerjs.com", port: 443, secure: true });
+  setPairingStatus("waiting");
+  setPeerError("");
 
-      conn.on("data", async (payload) => {
-        if (payload?.type === "image" && payload.data) {
-          try {
-            const file = await dataUrlToFile(payload.data, `axtr-mobile-${Date.now()}.jpg`);
-            setCapturedImage(file);
-            setIsCameraActive(false);
-            setError(null);
-            setStep(1);
-            setPairingStatus("received");
-            setLastReceivedAt(new Date());
-            conn.send({ type: "ack" });
-          } catch {
-            setPeerError("Could not read the incoming photo.");
-            setPairingStatus("error");
-          }
+  // Keep the URL in sync (and safe)
+  const u = new URL(window.location.href);
+  u.searchParams.set("session", id);
+  u.searchParams.delete("mobile");
+  window.history.replaceState({}, "", u.toString());
+
+  peer.on("connection", (conn) => {
+    if (cancelled) return;
+    setPairingStatus("connected");
+
+    conn.on("data", async (payload) => {
+      if (payload?.type === "image" && payload.data) {
+        try {
+          const file = await dataUrlToFile(payload.data, `axtr-mobile-${Date.now()}.jpg`);
+          setCapturedImage(file);
+          setIsCameraActive(false);
+          setError(null);
+          setStep(1);
+          setPairingStatus("received");
+          setLastReceivedAt(new Date());
+          conn.send({ type: "ack" });
+        } catch {
+          setPeerError("Could not read the incoming photo.");
+          setPairingStatus("error");
         }
-      });
-
-      conn.on("error", () => { setPeerError("Connection interrupted."); setPairingStatus("error"); });
-      conn.on("close", () => { if (!cancelled) { setPairingStatus("waiting"); } });
+      }
     });
 
-    peer.on("error", (e) => { if (!cancelled) { setPeerError(e?.message || "Peer error"); setPairingStatus("error"); } });
+    conn.on("error", () => { setPeerError("Connection interrupted."); setPairingStatus("error"); });
+    conn.on("close", () => { if (!cancelled) setPairingStatus("waiting"); });
+  });
 
-    return () => { cancelled = true; peer.destroy(); };
-  }, [clientType, sessionId]);
+  peer.on("error", (e) => {
+    if (!cancelled) {
+      setPeerError(e?.message || "Peer error");
+      setPairingStatus("error");
+    }
+  });
+
+  return () => { cancelled = true; try { peer.destroy(); } catch {} };
+}, [clientType, sessionId]);
+
 
   /* pairing: mobile connect (FIX: store conn and actually send) */
   useEffect(() => {
-    if (clientType !== "mobile" || !sessionId) return;
-    let cancelled = false;
-    const peer = new Peer(undefined, { host: "0.peerjs.com", port: 443, secure: true });
+  if (clientType !== "mobile" || !sessionId) return;
 
-    const connect = () => {
-      if (cancelled) return;
-      const conn = peer.connect(sessionId, { reliable: true });
-      mobileConnRef.current = conn;
+  const remoteId = normalizePeerId(sessionId);
+  if (!remoteId) {
+    setPeerError("Invalid session id.");
+    setPairingStatus("error");
+    return;
+  }
 
-      conn.on("open", () => { setPairingStatus("connected"); setPeerError(""); });
-      conn.on("data", (p) => { if (p?.type === "ack") setPairingStatus("received"); });
-      conn.on("error", () => { setPeerError("Connection lost. Reconnecting…"); setPairingStatus("error"); setTimeout(connect, 1200); });
-      conn.on("close", () => { setPairingStatus("waiting"); setTimeout(connect, 1200); });
-    };
+  let cancelled = false;
+  const peer = new Peer(undefined, { host: "0.peerjs.com", port: 443, secure: true });
 
-    peer.on("open", connect);
-    peer.on("error", (e) => { setPeerError(e?.message || "Peer error"); setPairingStatus("error"); });
+  const connect = () => {
+    if (cancelled) return;
+    const conn = peer.connect(remoteId, { reliable: true });
+    mobileConnRef.current = conn;
 
-    return () => { cancelled = true; try { peer.destroy(); } catch {} };
-  }, [clientType, sessionId]);
+    conn.on("open", () => { setPairingStatus("connected"); setPeerError(""); });
+    conn.on("data", (p) => { if (p?.type === "ack") setPairingStatus("received"); });
+    conn.on("error", () => { setPeerError("Connection lost. Reconnecting…"); setPairingStatus("error"); setTimeout(connect, 1200); });
+    conn.on("close", () => { setPairingStatus("waiting"); setTimeout(connect, 1200); });
+  };
+
+  peer.on("open", connect);
+  peer.on("error", (e) => { setPeerError(e?.message || "Peer error"); setPairingStatus("error"); });
+
+  return () => { cancelled = true; try { peer.destroy(); } catch {} };
+}, [clientType, sessionId]);
+
 
   /* progress sim (optional placeholder) */
   const stopProgress = useCallback(() => { if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; } }, []);
@@ -701,7 +734,7 @@ export default function App() {
               <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.4em] ${isDark ? "bg-white/5 text-white/70" : "bg-slate-100 text-slate-600"}`}>
                 <Smartphone className="h-4 w-4" /> Mobile Link
               </span>
-              <span className={`font-mono text-sm ${textSubtle}`}>{sessionId}</span>
+               <span className="font-mono text-sm">{normalizePeerId(sessionId)}</span>
             </div>
 
             <div className="mt-8 flex justify-center">
@@ -1064,7 +1097,7 @@ export default function App() {
             <Sparkles className="w-4 h-4" /> aXtr link
           </span>
           <h1 className={`text-3xl font-bold ${textPrimary}`}>Share your camera instantly</h1>
-          <p className={`text-sm ${textMuted}`}>Session <span className="font-mono">{sessionId}</span></p>
+          <p className={`text-sm ${textMuted}`}>Session <span className="font-mono">{normalizePeerId(sessionId)}</span></p>
           <div className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-sm`}
                style={{ background: palette.surface2, borderColor: palette.border }}>
             <Wifi className="w-4 h-4" /> {pairingCopy[pairingStatus] || pairingCopy.idle}
