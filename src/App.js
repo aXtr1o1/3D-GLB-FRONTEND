@@ -534,7 +534,7 @@ export default function App() {
     formData.append("image", imageFile);
 
     try {
-      const resp = await fetch("http://52.66.97.86:8000/generate", { method: "POST", body: formData });
+      const resp = await fetch("https://pseudoarticulately-ultramicroscopical-edwin.ngrok-free.dev/generate", { method: "POST", body: formData });
       const data = await resp.json();
       if (data.status === "completed" && data.outputs?.[0]) {
         const url = data.outputs[0];
